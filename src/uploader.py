@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Iterator
 
+from curl_cffi import requests as browser_requests
 import requests
 import yaml
 
@@ -171,20 +172,30 @@ class SensorStatus:
         )
 
 
-def with_retry(delay: int):
-    """Decorator to retry on session Timeout or ConnectionError."""
+TRANSIENT_ERRORS = (
+    requests.exceptions.ReadTimeout,
+    requests.exceptions.ConnectionError,
+    browser_requests.exceptions.ReadTimeout,
+    browser_requests.exceptions.ConnectionError,
+)
+
+
+def with_retry(delay: int, max_delay: int = 300):
+    """Decorator to retry on session Timeout or ConnectionError, with backoff."""
 
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            current_delay = delay
             while True:
                 try:
                     return func(*args, **kwargs)
-                except requests.exceptions.ReadTimeout:
-                    logger.info("Network timeout, retrying")
-                except requests.exceptions.ConnectionError:
-                    logger.info("Network connection error, retrying")
-                time.sleep(delay)
+                except TRANSIENT_ERRORS as exc:
+                    logger.warning(
+                        "%s, retrying in %is", type(exc).__name__, current_delay
+                    )
+                    time.sleep(current_delay)
+                    current_delay = min(current_delay * 2, max_delay)
 
         return wrapper
 
@@ -204,12 +215,19 @@ class EasyFollow:
         """Initialize with username, password and optional resume timestamp."""
         self.username = username
         self.password = password
-        self.session: requests.Session = requests.Session()
+        # EasyView sits behind a WAF that rejects the default TLS fingerprint of
+        # python-requests (HTTP 502 from datacenter IPs). Impersonating Chrome
+        # makes the login request indistinguishable from a browser.
+        self.session: browser_requests.Session = browser_requests.Session(
+            impersonate="chrome"
+        )
+        # Only the app specific headers are set: the User-Agent and the other
+        # default headers must stay those of the impersonated browser, otherwise
+        # the fingerprint becomes inconsistent again.
         self.session.headers.update(
             {
                 "DevInfo": "Android 12;Xiamoi vayu;Android 12",
                 "AppTag": "v=1.2.70(112);n=eyfo;p=android",
-                "User-Agent": "okhttp/3.5.0",
             }
         )
         self.resume_timestamp = timestamp
@@ -269,7 +287,7 @@ class EasyFollow:
     def _post(self, endpoint: str, data: dict) -> dict[str, Any]:
         """Send a POST request to the specified endpoint with the given data."""
         response = self.session.post(
-            f"{self.BASE_URL}/{endpoint}", data=data, timeout=10
+            f"{self.BASE_URL}/{endpoint}", data=data, timeout=(10, 120)
         )
         response.raise_for_status()
         return response.json()
@@ -278,7 +296,7 @@ class EasyFollow:
     def _get(self, endpoint: str, params: dict | None = None) -> dict[str, Any]:
         """Send a GET request to the specified endpoint with the given parameters."""
         response = self.session.get(
-            f"{self.BASE_URL}/{endpoint}", params=params, timeout=10
+            f"{self.BASE_URL}/{endpoint}", params=params, timeout=(10, 120)
         )
         response.raise_for_status()
         return response.json()
@@ -347,7 +365,11 @@ class EasyFollow:
             "platform": "google",
             "user_type": "M",
         }
-        self._post("login", data=data)
+        result = self._post("login", data=data)
+        if result.get("res") != "OK":
+            raise RuntimeError(
+                f"EasyView login failed for {self.username}: {result.get('msg')}"
+            )
         logger.info("logged in to EasyView as %s", self.username)
 
     def close(self) -> None:
@@ -404,7 +426,7 @@ class NightScout:
     def timestamp(self) -> datetime | None:
         """Get last sensor value timestamp from Nightscout."""
         response = self.session.get(
-            f"{self.url}/api/v1/entries.json", params={"count": 1}, timeout=10
+            f"{self.url}/api/v1/entries.json", params={"count": 1}, timeout=(10, 60)
         )
         response.raise_for_status()
         data = response.json()
@@ -425,7 +447,7 @@ class NightScout:
             response = self.session.post(
                 f"{self.url}/api/v1/entries.json",
                 json=[sensor_status.nightscout_entry],
-                timeout=10,
+                timeout=(10, 60),
             )
             response.raise_for_status()
             logger.info(
